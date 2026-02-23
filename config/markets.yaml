@@ -1,0 +1,48 @@
+# Market mapping configuration
+#
+# This file defines how sports score events map to Kalshi alternate line markets.
+# The Brain agent loads this at startup and uses it to build the ThresholdMap.
+#
+# Kalshi ticker format for totals (example):
+#   KXNCAAB-25KENTST-TOTAL    <- NCAA Basketball game total
+#   KXEPL-25MANCITY-TOTAL     <- Premier League game total
+#   KXUCL-25REALMAD-TOTAL     <- Champions League game total
+#
+# The actual ticker suffix per alt-line is fetched from Kalshi's REST API at startup.
+# This file provides the search patterns to find those markets.
+
+ncaa_basketball:
+  # SportsData.io competition key
+  sportsdata_competition: "NCAA"
+  # Kalshi full-game total series prefix
+  # Real ticker format: KXNCAAMBTOTAL-26FEB19WEBBRAD-177
+  # The trailing number is the trigger score (total must reach it, line step ~3)
+  kalshi_series_pattern: "KXNCAAMBTOTAL"
+  # Kalshi date prefix format: strftime("%y%b%d").upper() e.g. "26FEB19"
+  kalshi_date_format: "%y%b%d"
+  # Minimum total points before we start monitoring alt lines
+  min_total_threshold: 80
+  # How many alt-line markets above current score to pre-subscribe to
+  lookahead_lines: 5
+
+premier_league:
+  sportsdata_competition: "EPL"
+  # SportsData.io competition ID for Premier League
+  sportsdata_competition_id: 7
+  kalshi_series_pattern: "KXEPL"
+  line_step: 0.5
+  min_total_threshold: 0
+  max_total_threshold: 10
+  lookback_lines: 1
+  lookahead_lines: 3
+
+champions_league:
+  sportsdata_competition: "UCL"
+  # SportsData.io competition ID for Champions League
+  sportsdata_competition_id: 5
+  kalshi_series_pattern: "KXUCL"
+  line_step: 0.5
+  min_total_threshold: 0
+  max_total_threshold: 10
+  lookback_lines: 1
+  lookahead_lines: 3
