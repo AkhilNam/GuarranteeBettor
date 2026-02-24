@@ -34,7 +34,7 @@ from config.settings import settings
 from kalshi.auth import KalshiAuth
 from kalshi.rest_client import KalshiRestClient
 from kalshi.ws_client import KalshiWSClient
-from models.state import RiskState
+from models.state import RiskState, CrunchTimeGate
 from sports.espn import ESPNClient
 from strategy.threshold_map import ThresholdMap
 from agents.oracle import OracleAgent
@@ -89,9 +89,9 @@ async def run() -> None:
     ucl_cfg = markets_cfg["champions_league"]
 
     feeds = [
-        ESPNClient(sport="ncaa_basketball", poll_interval_s=settings.sports_poll_interval_s),
-        ESPNClient(sport="premier_league",  poll_interval_s=settings.sports_poll_interval_s),
-        ESPNClient(sport="champions_league", poll_interval_s=settings.sports_poll_interval_s),
+        ESPNClient(sport="ncaa_basketball", gate=gate, active_interval_s=settings.sports_poll_interval_s),
+        ESPNClient(sport="premier_league",  gate=gate, active_interval_s=settings.sports_poll_interval_s),
+        ESPNClient(sport="champions_league", gate=gate, active_interval_s=settings.sports_poll_interval_s),
     ]
 
     # -----------------------------------------------------------------------
@@ -99,6 +99,7 @@ async def run() -> None:
     # -----------------------------------------------------------------------
     threshold_map = ThresholdMap()
     risk = RiskState()
+    gate = CrunchTimeGate()
 
     oracle = OracleAgent(bus=bus, feeds=feeds)
 
@@ -135,6 +136,7 @@ async def run() -> None:
         max_trades_per_game=settings.max_trades_per_game,
     )
     brain.set_shield(shield, risk)
+    brain.set_gate(gate)
 
     sniper = SniperAgent(bus=bus, rest_client=rest_client)
 

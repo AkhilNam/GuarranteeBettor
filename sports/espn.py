@@ -21,6 +21,7 @@ import aiohttp
 from sports.base import SportsFeedClient
 from sports.normalizer import espn_ncaa_to_game_event, espn_soccer_to_game_event
 from models.events import GameEvent, Sport
+from models.state import CrunchTimeGate
 
 log = logging.getLogger(__name__)
 
@@ -41,13 +42,30 @@ _ESPN_URLS: dict[str, str] = {
 class ESPNClient(SportsFeedClient):
     """
     Polls ESPN's public scoreboard API for live scores.
-    Emits a GameEvent only when a game's score actually changes.
+
+    Two-speed polling controlled by CrunchTimeGate:
+      - MONITORING (30s default): polls slowly so Brain can discover games and
+        subscribe to Kalshi markets. No trading happens yet.
+      - ACTIVE (0.75s): kicks in as soon as Brain detects crunch time for any
+        game and activates the gate. Provides the fast score updates needed for
+        latency arb.
+
+    This means ESPN is called ~2 times/min in monitoring mode vs ~80 times/min
+    in active mode — saving calls during the bulk of the game when no edge exists.
     """
 
-    def __init__(self, sport: Sport, poll_interval_s: float = 0.75) -> None:
+    def __init__(
+        self,
+        sport: Sport,
+        gate: CrunchTimeGate,
+        active_interval_s: float = 0.75,
+        monitoring_interval_s: float = 30.0,
+    ) -> None:
         self._sport = sport
+        self._gate = gate
         self._url = _ESPN_URLS[sport]
-        self._poll_interval_s = poll_interval_s
+        self._active_interval_s = active_interval_s
+        self._monitoring_interval_s = monitoring_interval_s
         self._session: aiohttp.ClientSession | None = None
         # Dedup cache: game_id -> (home_score, away_score)
         self._last_scores: dict[str, tuple[int, int]] = {}
@@ -62,7 +80,8 @@ class ESPNClient(SportsFeedClient):
             connector=aiohttp.TCPConnector(limit=5, keepalive_timeout=30),
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        log.info("%s feed client initialized", self.name)
+        log.info("%s feed client initialized (monitoring=%.0fs active=%.2fs)",
+                 self.name, self._monitoring_interval_s, self._active_interval_s)
 
     async def shutdown(self) -> None:
         if self._session:
@@ -83,8 +102,14 @@ class ESPNClient(SportsFeedClient):
                 if consecutive_errors == 1 or consecutive_errors % 100 == 0:
                     log.warning("%s poll error (×%d): %s", self.name, consecutive_errors, exc)
 
+            # Use fast interval when any game is in crunch time, slow otherwise
+            interval = (
+                self._active_interval_s
+                if self._gate.any_active()
+                else self._monitoring_interval_s
+            )
             elapsed = time.monotonic() - poll_start
-            await asyncio.sleep(max(0.0, self._poll_interval_s - elapsed))
+            await asyncio.sleep(max(0.0, interval - elapsed))
 
     async def _fetch_live_games(self) -> list[GameEvent]:
         received_at = time.monotonic_ns()

@@ -29,13 +29,18 @@ from typing import TYPE_CHECKING
 from bus.event_bus import EventBus
 from kalshi.rest_client import KalshiRestClient
 from models.events import GameEvent, ExecuteTrade, Sport
-from models.state import RiskState
+from models.state import RiskState, CrunchTimeGate
 from strategy.threshold_map import ThresholdMap, ThresholdEntry, _trigger_from_ticker
 from strategy.edge_calculator import has_edge, max_tradeable_price
 
 if TYPE_CHECKING:
     from agents.watcher import WatcherAgent
     from agents.shield import ShieldAgent
+
+# YES ask threshold above which we consider a game in crunch time.
+# 60 cents means the market is pricing a ~60% chance of hitting the next total
+# threshold — i.e., the current score is very close to that line.
+_CRUNCH_TIME_ASK_THRESHOLD = 60
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +70,7 @@ class BrainAgent:
         self._game_state: dict[str, str] = {}
         self._shield: "ShieldAgent | None" = None
         self._risk: RiskState | None = None
+        self._gate: CrunchTimeGate | None = None
 
         # Cache of today's Kalshi total markets, fetched once per sport per day
         # sport -> list[market_dict]
@@ -74,6 +80,9 @@ class BrainAgent:
     def set_shield(self, shield: "ShieldAgent", risk: RiskState) -> None:
         self._shield = shield
         self._risk = risk
+
+    def set_gate(self, gate: CrunchTimeGate) -> None:
+        self._gate = gate
 
     async def run(self) -> None:
         log.info("Brain agent running")
@@ -89,6 +98,8 @@ class BrainAgent:
     async def _process_event(self, event: GameEvent) -> None:
         if event.is_final:
             self._threshold_map.unregister_game(event.sport, event.game_id)
+            if self._gate:
+                self._gate.deactivate(event.game_id)
             return
 
         state = self._game_state.get(event.game_id)
@@ -99,6 +110,9 @@ class BrainAgent:
         if self._game_state.get(event.game_id) != "registered":
             return
 
+        # Check crunch time BEFORE threshold scan — activates fast ESPN polling
+        self._check_crunch_time(event)
+
         entries = self._threshold_map.get_entries(event.sport, event.game_id)
         for entry in entries:
             if entry.already_triggered:
@@ -106,6 +120,41 @@ class BrainAgent:
             if event.total_score < entry.trigger_score:
                 continue
             await self._evaluate_and_signal(event, entry)
+
+    def _check_crunch_time(self, event: GameEvent) -> None:
+        """
+        Activate the CrunchTimeGate for this game when Kalshi prices signal
+        the game is in its final minutes.
+
+        Signal: the lowest unresolved threshold's YES ask >= 60 cents.
+        This means the market believes there's a >=60% chance the current score
+        will reach that next threshold — i.e., we're very close to it with
+        little time left.
+
+        When activated, ESPNClient switches from 30s monitoring to 0.75s polling.
+        """
+        if self._gate is None or self._gate.is_active(event.game_id):
+            return  # Already active or no gate configured
+
+        entries = self._threshold_map.get_entries(event.sport, event.game_id)
+        unresolved = [e for e in entries if not e.already_triggered]
+        if not unresolved:
+            return  # All lines resolved — game effectively over
+
+        # Check the lowest (closest) unresolved threshold's market price
+        lowest = min(unresolved, key=lambda e: e.trigger_score)
+        market = self._watcher.get_latest(lowest.market_ticker)
+        if market is None:
+            return  # No Kalshi data yet
+
+        if market.yes_ask >= _CRUNCH_TIME_ASK_THRESHOLD:
+            self._gate.activate(event.game_id)
+            log.info(
+                "Brain: crunch time for game=%s — yes_ask=%d >= %d on ticker=%s "
+                "(total=%d next_trigger=%d)",
+                event.game_id, market.yes_ask, _CRUNCH_TIME_ASK_THRESHOLD,
+                lowest.market_ticker, event.total_score, lowest.trigger_score,
+            )
 
     async def _evaluate_and_signal(self, event: GameEvent, entry: ThresholdEntry) -> None:
         entry.already_triggered = True  # Set first — no duplicate signals even if eval fails

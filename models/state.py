@@ -4,7 +4,43 @@ These are NOT shared across agents directly — each agent owns its own state.
 """
 
 from __future__ import annotations
+import logging
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
+
+
+class CrunchTimeGate:
+    """
+    Shared gate between Brain and ESPNClient.
+
+    Brain writes: calls activate(game_id) when Kalshi prices indicate a game
+    is in crunch time (lowest unresolved threshold YES ask >= 60 cents).
+
+    ESPNClient reads: runs at monitoring_interval_s (30s) when no games are
+    active, switches to active_interval_s (0.75s) as soon as any game activates.
+
+    Game IDs are ESPN numeric IDs (e.g. "401638636"), set by Brain from the
+    GameEvent.game_id field which originates from ESPN.
+    """
+
+    def __init__(self) -> None:
+        self._active: set[str] = set()
+
+    def activate(self, game_id: str) -> None:
+        if game_id not in self._active:
+            self._active.add(game_id)
+            log.info("CrunchTimeGate: activated game_id=%s (%d active)", game_id, len(self._active))
+
+    def deactivate(self, game_id: str) -> None:
+        self._active.discard(game_id)
+        log.info("CrunchTimeGate: deactivated game_id=%s (%d active)", game_id, len(self._active))
+
+    def is_active(self, game_id: str) -> bool:
+        return game_id in self._active
+
+    def any_active(self) -> bool:
+        return bool(self._active)
 
 
 @dataclass(slots=True)
