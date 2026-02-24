@@ -89,6 +89,11 @@ async def run() -> None:
     pl_cfg = markets_cfg["premier_league"]
     ucl_cfg = markets_cfg["champions_league"]
 
+    threshold_map = ThresholdMap()
+    moneyline_map = MoneylineMap()
+    risk = RiskState()
+    gate = CrunchTimeGate()
+
     feeds = [
         ESPNClient(sport="ncaa_basketball", gate=gate, active_interval_s=settings.sports_poll_interval_s),
         ESPNClient(sport="premier_league",  gate=gate, active_interval_s=settings.sports_poll_interval_s),
@@ -98,10 +103,6 @@ async def run() -> None:
     # -----------------------------------------------------------------------
     # Agents
     # -----------------------------------------------------------------------
-    threshold_map = ThresholdMap()
-    moneyline_map = MoneylineMap()
-    risk = RiskState()
-    gate = CrunchTimeGate()
 
     oracle = OracleAgent(bus=bus, feeds=feeds)
 
