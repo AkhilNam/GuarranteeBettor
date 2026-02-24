@@ -24,6 +24,11 @@ ncaa_basketball:
   min_total_threshold: 80
   # How many alt-line markets above current score to pre-subscribe to
   lookahead_lines: 5
+  # Kalshi moneyline series — YES resolves if the specified team wins.
+  # NOTE: verify the exact series name by calling GET /markets and inspecting
+  # live NCAA moneyline ticker prefixes. Placeholder below follows Kalshi naming
+  # conventions observed on totals; update if the actual prefix differs.
+  kalshi_ml_series_pattern: "KXNCAAMBML"
 
 premier_league:
   sportsdata_competition: "EPL"
@@ -35,6 +40,8 @@ premier_league:
   max_total_threshold: 10
   lookback_lines: 1
   lookahead_lines: 3
+  # NOTE: verify series name against live Kalshi market tickers
+  kalshi_ml_series_pattern: "KXEPLML"
 
 champions_league:
   sportsdata_competition: "UCL"
@@ -46,3 +53,5 @@ champions_league:
   max_total_threshold: 10
   lookback_lines: 1
   lookahead_lines: 3
+  # NOTE: verify series name against live Kalshi market tickers
+  kalshi_ml_series_pattern: "KXUCLML"

@@ -55,3 +55,35 @@ def max_tradeable_price(min_edge_cents: int, fee_rate: float = KALSHI_FEE_RATE) 
 
 def has_edge(yes_ask_cents: int, min_edge_cents: int, fee_rate: float = KALSHI_FEE_RATE) -> bool:
     return calculate_edge(yes_ask_cents, fee_rate) >= min_edge_cents
+
+
+# ---------------------------------------------------------------------------
+# Moneyline edge (probability-weighted)
+# ---------------------------------------------------------------------------
+
+def calculate_moneyline_edge(
+    ask_cents: int,
+    win_prob: float,
+    fee_rate: float = KALSHI_FEE_RATE,
+) -> int:
+    """
+    Expected edge for a moneyline contract given estimated win probability.
+
+    Unlike totals (where win_prob ≈ 100% after threshold crossed), moneyline
+    win_prob is a model estimate based on score lead and time remaining.
+
+    Edge = win_prob * net_payout - ask
+         = win_prob * (100 * (1 - fee_rate)) - ask_cents
+    """
+    net_payout = CONTRACT_PAYOUT_CENTS * (1.0 - fee_rate)
+    ev = win_prob * net_payout
+    return int(ev - ask_cents)
+
+
+def has_moneyline_edge(
+    ask_cents: int,
+    win_prob: float,
+    min_edge_cents: int,
+    fee_rate: float = KALSHI_FEE_RATE,
+) -> bool:
+    return calculate_moneyline_edge(ask_cents, win_prob, fee_rate) >= min_edge_cents

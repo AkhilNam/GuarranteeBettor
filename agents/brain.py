@@ -31,7 +31,8 @@ from kalshi.rest_client import KalshiRestClient
 from models.events import GameEvent, ExecuteTrade, Sport
 from models.state import RiskState, CrunchTimeGate
 from strategy.threshold_map import ThresholdMap, ThresholdEntry, _trigger_from_ticker
-from strategy.edge_calculator import has_edge, max_tradeable_price
+from strategy.moneyline_map import MoneylineMap, MoneylineEntry
+from strategy.edge_calculator import has_edge, max_tradeable_price, has_moneyline_edge, calculate_moneyline_edge
 
 if TYPE_CHECKING:
     from agents.watcher import WatcherAgent
@@ -56,6 +57,8 @@ class BrainAgent:
         max_slippage_cents: int,
         default_quantity: int,
         kalshi_series_patterns: dict[str, str],
+        moneyline_map: MoneylineMap | None = None,
+        ml_series_patterns: dict[str, str] | None = None,
     ) -> None:
         self._bus = bus
         self._watcher = watcher
@@ -65,16 +68,23 @@ class BrainAgent:
         self._max_slippage_cents = max_slippage_cents
         self._default_quantity = default_quantity
         self._kalshi_series_patterns = kalshi_series_patterns
+        self._moneyline_map = moneyline_map
+        self._ml_series_patterns = ml_series_patterns or {}
 
         # game_id -> registration state: "pending" | "registered" | "failed"
         self._game_state: dict[str, str] = {}
+        self._ml_game_state: dict[str, str] = {}   # separate ML registration state
         self._shield: "ShieldAgent | None" = None
         self._risk: RiskState | None = None
         self._gate: CrunchTimeGate | None = None
 
+        # Track previous scores per game so we know who scored on each event
+        self._prev_scores: dict[str, tuple[int, int]] = {}
+
         # Cache of today's Kalshi total markets, fetched once per sport per day
         # sport -> list[market_dict]
         self._todays_markets: dict[str, list[dict]] = {}
+        self._ml_todays_markets: dict[str, list[dict]] = {}
         self._markets_fetched_date: str = ""
 
     def set_shield(self, shield: "ShieldAgent", risk: RiskState) -> None:
@@ -96,30 +106,47 @@ class BrainAgent:
                 log.exception("Brain error processing event: %s", exc)
 
     async def _process_event(self, event: GameEvent) -> None:
+        # Snapshot previous scores before updating — used by ML signal logic
+        prev_scores = self._prev_scores.get(event.game_id, (0, 0))
+        self._prev_scores[event.game_id] = (event.home_score, event.away_score)
+
         if event.is_final:
             self._threshold_map.unregister_game(event.sport, event.game_id)
+            if self._moneyline_map:
+                self._moneyline_map.unregister_game(event.sport, event.game_id)
             if self._gate:
                 self._gate.deactivate(event.game_id)
+            self._prev_scores.pop(event.game_id, None)
             return
 
+        # ── Totals registration ──────────────────────────────────────────────
         state = self._game_state.get(event.game_id)
         if state is None:
             self._game_state[event.game_id] = "pending"
             await self._register_game(event)
 
-        if self._game_state.get(event.game_id) != "registered":
-            return
+        # ── Moneyline registration (independent of totals) ───────────────────
+        if self._moneyline_map and self._ml_game_state.get(event.game_id) is None:
+            self._ml_game_state[event.game_id] = "pending"
+            await self._register_moneyline(event)
 
         # Check crunch time BEFORE threshold scan — activates fast ESPN polling
-        self._check_crunch_time(event)
+        if self._game_state.get(event.game_id) == "registered":
+            self._check_crunch_time(event)
 
-        entries = self._threshold_map.get_entries(event.sport, event.game_id)
-        for entry in entries:
-            if entry.already_triggered:
-                continue
-            if event.total_score < entry.trigger_score:
-                continue
-            await self._evaluate_and_signal(event, entry)
+        # ── Totals signals ───────────────────────────────────────────────────
+        if self._game_state.get(event.game_id) == "registered":
+            entries = self._threshold_map.get_entries(event.sport, event.game_id)
+            for entry in entries:
+                if entry.already_triggered:
+                    continue
+                if event.total_score < entry.trigger_score:
+                    continue
+                await self._evaluate_and_signal(event, entry)
+
+        # ── Moneyline signals ────────────────────────────────────────────────
+        if self._moneyline_map and self._ml_game_state.get(event.game_id) == "registered":
+            await self._check_moneyline_signal(event, prev_scores)
 
     def _check_crunch_time(self, event: GameEvent) -> None:
         """
@@ -195,6 +222,134 @@ class BrainAgent:
             entry.market_ticker, yes_ask, limit_price,
             signal.quantity, signal.signal_id,
         )
+
+    async def _check_moneyline_signal(
+        self,
+        event: GameEvent,
+        prev_scores: tuple[int, int],
+    ) -> None:
+        """
+        Fire a moneyline signal when the leading team just scored and Kalshi
+        hasn't repriced yet.
+
+        Only fires when:
+          1. The scoring team is currently WINNING (not just tied or trailing)
+          2. Estimated win probability gives sufficient edge vs current ask
+          3. Signal cooldown has elapsed (prevents spam on quick free throws)
+        """
+        if self._risk and self._risk.is_halted:
+            return
+
+        prev_home, prev_away = prev_scores
+        home_scored = event.home_score > prev_home
+        away_scored = event.away_score > prev_away
+        lead = event.home_score - event.away_score
+
+        entries = self._moneyline_map.get_entries(event.sport, event.game_id)  # type: ignore[union-attr]
+        now_ns = time.monotonic_ns()
+
+        for entry in entries:
+            if entry.on_cooldown(now_ns):
+                continue
+
+            # Determine if the relevant team just scored and is currently winning
+            if entry.team_side == "home":
+                if not home_scored or lead <= 0:
+                    continue
+                margin = lead
+                ask_to_check_fn = lambda m: m.yes_ask if entry.trade_side == "yes" else m.no_ask
+            else:
+                if not away_scored or lead >= 0:
+                    continue
+                margin = abs(lead)
+                ask_to_check_fn = lambda m: m.yes_ask if entry.trade_side == "yes" else m.no_ask
+
+            win_prob = _estimate_win_prob(margin, event.period, event.sport)
+            if win_prob == 0.0:
+                continue
+
+            market = self._watcher.get_latest(entry.market_ticker)
+            if market is None:
+                continue
+
+            ask = ask_to_check_fn(market)
+            if not has_moneyline_edge(ask, win_prob, self._min_edge_cents):
+                log.debug(
+                    "Brain ML: no edge game=%s %s margin=%d win_prob=%.0f%% ask=%d",
+                    event.game_id, entry.team_side, margin, win_prob * 100, ask,
+                )
+                continue
+
+            entry.mark_signaled(now_ns)
+            signal = ExecuteTrade(
+                signal_id=str(uuid.uuid4()),
+                market_ticker=entry.market_ticker,
+                side=entry.trade_side,
+                max_price_cents=min(ask + self._max_slippage_cents, 97),
+                quantity=self._default_quantity,
+                game_id=event.game_id,
+                generated_at_ns=now_ns,
+            )
+            self._bus.publish_trade_signal(signal)
+            log.info(
+                "Brain ML SIGNAL: game=%s %s+%d (p%d) ticker=%s side=%s "
+                "win_prob=%.0f%% ask=%d edge=%d signal_id=%s",
+                event.game_id, entry.team_side, margin, event.period,
+                entry.market_ticker, entry.trade_side,
+                win_prob * 100, ask,
+                calculate_moneyline_edge(ask, win_prob),
+                signal.signal_id,
+            )
+
+    async def _register_moneyline(self, event: GameEvent) -> None:
+        """
+        Fetch today's Kalshi moneyline markets for this sport and register
+        entries for this game.
+        """
+        series = self._ml_series_patterns.get(event.sport)
+        if not series:
+            self._ml_game_state[event.game_id] = "failed"
+            return
+
+        today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        if event.sport not in self._ml_todays_markets or self._markets_fetched_date != today:
+            await self._refresh_ml_markets(event.sport, series)
+
+        all_markets = self._ml_todays_markets.get(event.sport, [])
+        game_markets = _filter_markets_for_game(all_markets, event)
+
+        if not game_markets:
+            log.warning(
+                "Brain ML: no moneyline markets found for game=%s (%s vs %s)",
+                event.game_id, event.home_team, event.away_team,
+            )
+            self._ml_game_state[event.game_id] = "failed"
+            return
+
+        entries = _build_moneyline_entries(game_markets, event)
+        if not entries:
+            self._ml_game_state[event.game_id] = "failed"
+            return
+
+        tickers = list({e.market_ticker for e in entries})
+        self._watcher.subscribe_tickers(tickers)
+        self._moneyline_map.register_game(event.sport, event.game_id, entries)  # type: ignore[union-attr]
+        self._ml_game_state[event.game_id] = "registered"
+
+    async def _refresh_ml_markets(self, sport: Sport, series: str) -> None:
+        today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        try:
+            markets = await self._rest.get_markets(series_ticker=series, limit=500)
+            date_prefix = datetime.now(tz=timezone.utc).strftime("%y%b%d").upper()
+            todays = [m for m in markets if f"-{date_prefix}" in m.get("ticker", "")]
+            self._ml_todays_markets[sport] = todays
+            log.info(
+                "Brain ML: fetched %d/%d %s markets for today (%s)",
+                len(todays), len(markets), series, date_prefix,
+            )
+        except Exception as exc:
+            log.error("Brain ML: failed to fetch markets sport=%s: %s", sport, exc)
+            self._ml_todays_markets[sport] = []
 
     async def _register_game(self, event: GameEvent) -> None:
         """
@@ -272,6 +427,80 @@ class BrainAgent:
         except Exception as exc:
             log.error("Brain: failed to fetch markets for sport=%s: %s", sport, exc)
             self._todays_markets[sport] = []
+
+
+def _estimate_win_prob(lead_margin: int, period: int, sport: str) -> float:
+    """
+    Rough win probability for the currently leading team.
+
+    Only activates in the second half / second period — too much variance
+    earlier in the game for reliable edge. Returns 0.0 to skip trading.
+
+    CBB thresholds are conservative: a 5-point lead in CBB with 10 min left
+    is NOT 72% — it only becomes that reliable in the final few minutes.
+    For now we restrict to period 2 as a coarse gate; a proper model would
+    also use time remaining from game_clock.
+    """
+    if sport == "ncaa_basketball":
+        if period < 2:
+            return 0.0
+        if lead_margin >= 20: return 0.97
+        if lead_margin >= 15: return 0.93
+        if lead_margin >= 10: return 0.86
+        if lead_margin >= 7:  return 0.78
+        if lead_margin >= 5:  return 0.68
+        return 0.0  # < 5 pts too risky
+
+    elif sport in ("premier_league", "champions_league"):
+        if period < 2:
+            return 0.0
+        if lead_margin >= 3: return 0.97
+        if lead_margin >= 2: return 0.91
+        if lead_margin >= 1: return 0.68
+        return 0.0
+
+    return 0.0
+
+
+def _build_moneyline_entries(game_markets: list[dict], event: GameEvent) -> list[MoneylineEntry]:
+    """
+    Build MoneylineEntry list from Kalshi moneyline markets for this game.
+
+    Supports two Kalshi layouts:
+      1. Single market per game — YES = home wins, NO = away wins.
+         Detected when there is exactly one market for the game.
+      2. Two markets per game — one per team ("Will X win?").
+         Detected when there are two markets; home vs away is determined by
+         matching each market's title against the event's team abbreviations.
+    """
+    if not game_markets:
+        return []
+
+    if len(game_markets) == 1:
+        # Single binary market: YES = home wins, NO = away wins
+        ticker = game_markets[0].get("ticker", "")
+        return [
+            MoneylineEntry(market_ticker=ticker, team_side="home", trade_side="yes"),
+            MoneylineEntry(market_ticker=ticker, team_side="away", trade_side="no"),
+        ]
+
+    # Multiple markets: try to match each to a team
+    entries: list[MoneylineEntry] = []
+    for mkt in game_markets[:2]:  # only need 2
+        ticker = mkt.get("ticker", "")
+        title = mkt.get("title", "")
+        # Check if the home team's name appears earlier in the title (rough heuristic)
+        home_abbrev = event.home_team.upper()
+        away_abbrev = event.away_team.upper()
+        title_up = title.upper()
+        home_pos = title_up.find(home_abbrev[:4]) if len(home_abbrev) >= 4 else -1
+        away_pos = title_up.find(away_abbrev[:4]) if len(away_abbrev) >= 4 else -1
+        if home_pos >= 0 and (away_pos < 0 or home_pos < away_pos):
+            entries.append(MoneylineEntry(market_ticker=ticker, team_side="home", trade_side="yes"))
+        else:
+            entries.append(MoneylineEntry(market_ticker=ticker, team_side="away", trade_side="yes"))
+
+    return entries
 
 
 def _filter_markets_for_game(markets: list[dict], event: GameEvent) -> list[dict]:

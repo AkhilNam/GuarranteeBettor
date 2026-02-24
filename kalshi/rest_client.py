@@ -12,6 +12,7 @@ import logging
 import socket
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -38,6 +39,10 @@ class KalshiRestClient:
         self._session: aiohttp.ClientSession | None = None
         self._connector: aiohttp.TCPConnector | None = None
         self._keepalive_task: asyncio.Task | None = None
+        # Kalshi signs over the full URL path including the API version prefix
+        # e.g. base_url="https://demo-api.kalshi.co/trade-api/v2"
+        #      → _sign_prefix="/trade-api/v2"
+        self._sign_prefix = urlparse(self._base_url).path.rstrip("/")
 
     async def startup(self) -> None:
         """
@@ -87,7 +92,9 @@ class KalshiRestClient:
 
     async def _request(self, method: str, path: str, json_body: dict | None = None) -> dict:
         assert self._session, "Call startup() first"
-        headers = self._auth.get_headers(method, path)
+        # Sign over full URL path: /trade-api/v2/portfolio/balance
+        # not just the relative endpoint path: /portfolio/balance
+        headers = self._auth.get_headers(method, self._sign_prefix + path)
         url = self._url(path)
         async with self._session.request(
             method, url, headers=headers, json=json_body

@@ -37,6 +37,7 @@ from kalshi.ws_client import KalshiWSClient
 from models.state import RiskState, CrunchTimeGate
 from sports.espn import ESPNClient
 from strategy.threshold_map import ThresholdMap
+from strategy.moneyline_map import MoneylineMap
 from agents.oracle import OracleAgent
 from agents.watcher import WatcherAgent
 from agents.brain import BrainAgent
@@ -98,6 +99,7 @@ async def run() -> None:
     # Agents
     # -----------------------------------------------------------------------
     threshold_map = ThresholdMap()
+    moneyline_map = MoneylineMap()
     risk = RiskState()
     gate = CrunchTimeGate()
 
@@ -117,6 +119,12 @@ async def run() -> None:
         "champions_league": ucl_cfg["kalshi_series_pattern"],
     }
 
+    ml_series_patterns = {
+        "ncaa_basketball": ncaa_cfg.get("kalshi_ml_series_pattern", ""),
+        "premier_league": pl_cfg.get("kalshi_ml_series_pattern", ""),
+        "champions_league": ucl_cfg.get("kalshi_ml_series_pattern", ""),
+    }
+
     brain = BrainAgent(
         bus=bus,
         watcher=watcher,
@@ -126,6 +134,8 @@ async def run() -> None:
         max_slippage_cents=settings.max_price_slippage_cents,
         default_quantity=settings.default_quantity,
         kalshi_series_patterns=kalshi_series_patterns,
+        moneyline_map=moneyline_map,
+        ml_series_patterns=ml_series_patterns,
     )
 
     shield = ShieldAgent(
