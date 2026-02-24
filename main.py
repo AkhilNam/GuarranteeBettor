@@ -35,7 +35,7 @@ from kalshi.auth import KalshiAuth
 from kalshi.rest_client import KalshiRestClient
 from kalshi.ws_client import KalshiWSClient
 from models.state import RiskState
-from sports.sportsdata_io import SportsDataIOClient
+from sports.espn import ESPNClient
 from strategy.threshold_map import ThresholdMap
 from agents.oracle import OracleAgent
 from agents.watcher import WatcherAgent
@@ -89,26 +89,9 @@ async def run() -> None:
     ucl_cfg = markets_cfg["champions_league"]
 
     feeds = [
-        SportsDataIOClient(
-            sport="ncaa_basketball",
-            api_key=settings.sportsdata_api_key_ncaa,
-            base_url=settings.sportsdata_base_url_ncaa,
-            poll_interval_s=settings.sports_poll_interval_s,
-        ),
-        SportsDataIOClient(
-            sport="premier_league",
-            api_key=settings.sportsdata_api_key_soccer,
-            base_url=settings.sportsdata_base_url_soccer,
-            poll_interval_s=settings.sports_poll_interval_s,
-            competition_id=pl_cfg.get("sportsdata_competition_id"),
-        ),
-        SportsDataIOClient(
-            sport="champions_league",
-            api_key=settings.sportsdata_api_key_soccer,
-            base_url=settings.sportsdata_base_url_soccer,
-            poll_interval_s=settings.sports_poll_interval_s,
-            competition_id=ucl_cfg.get("sportsdata_competition_id"),
-        ),
+        ESPNClient(sport="ncaa_basketball", poll_interval_s=settings.sports_poll_interval_s),
+        ESPNClient(sport="premier_league",  poll_interval_s=settings.sports_poll_interval_s),
+        ESPNClient(sport="champions_league", poll_interval_s=settings.sports_poll_interval_s),
     ]
 
     # -----------------------------------------------------------------------
