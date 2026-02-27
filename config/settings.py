@@ -44,8 +44,8 @@ class Settings:
     # --- Strategy ---
     min_edge_cents: int                   # Minimum EV per contract to fire a signal (e.g. 3)
     max_price_slippage_cents: int         # Max extra cents above ask we'll accept (e.g. 2)
-    default_quantity: int                 # Contracts per signal (e.g. 10)
-    max_quantity: int                     # Hard cap per signal
+    max_spend_per_trade_cents: int        # Budget per signal in cents (e.g. 100 = $1)
+    max_quantity: int                     # Hard cap on contracts per signal regardless of budget
 
     # --- Risk ---
     max_daily_loss_cents: int             # Circuit breaker: halt if daily P&L < -X
@@ -85,7 +85,7 @@ def load_settings() -> Settings:
         optic_odds_api_key=_optional("OPTIC_ODDS_API_KEY"),
         min_edge_cents=int(_optional("MIN_EDGE_CENTS", "3")),
         max_price_slippage_cents=int(_optional("MAX_PRICE_SLIPPAGE_CENTS", "2")),
-        default_quantity=int(_optional("DEFAULT_QUANTITY", "10")),
+        max_spend_per_trade_cents=int(_optional("MAX_SPEND_PER_TRADE_CENTS", "100")),  # $1
         max_quantity=int(_optional("MAX_QUANTITY", "50")),
         max_daily_loss_cents=int(_optional("MAX_DAILY_LOSS_CENTS", "10000")),   # $100
         max_open_exposure_cents=int(_optional("MAX_OPEN_EXPOSURE_CENTS", "50000")),  # $500

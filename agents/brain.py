@@ -55,7 +55,8 @@ class BrainAgent:
         threshold_map: ThresholdMap,
         min_edge_cents: int,
         max_slippage_cents: int,
-        default_quantity: int,
+        max_spend_per_trade_cents: int,
+        max_quantity: int,
         kalshi_series_patterns: dict[str, str],
         moneyline_map: MoneylineMap | None = None,
         ml_series_patterns: dict[str, str] | None = None,
@@ -66,7 +67,8 @@ class BrainAgent:
         self._threshold_map = threshold_map
         self._min_edge_cents = min_edge_cents
         self._max_slippage_cents = max_slippage_cents
-        self._default_quantity = default_quantity
+        self._max_spend_per_trade_cents = max_spend_per_trade_cents
+        self._max_quantity = max_quantity
         self._kalshi_series_patterns = kalshi_series_patterns
         self._moneyline_map = moneyline_map
         self._ml_series_patterns = ml_series_patterns or {}
@@ -148,6 +150,19 @@ class BrainAgent:
         if self._moneyline_map and self._ml_game_state.get(event.game_id) == "registered":
             await self._check_moneyline_signal(event, prev_scores)
 
+    def _quantity_for_price(self, ask_cents: int) -> int:
+        """
+        Calculate contract quantity so total spend ≈ MAX_SPEND_PER_TRADE_CENTS.
+        Always at least 1, never more than max_quantity.
+
+        Example ($1 budget):
+          ask=45¢ → 100//45 = 2 contracts → spend=90¢ ≈ $1
+          ask=20¢ → 100//20 = 5 contracts → spend=$1
+          ask=80¢ → 100//80 = 1 contract  → spend=80¢ ≈ $1
+        """
+        qty = max(1, self._max_spend_per_trade_cents // max(ask_cents, 1))
+        return min(qty, self._max_quantity)
+
     def _check_crunch_time(self, event: GameEvent) -> None:
         """
         Activate the CrunchTimeGate for this game when Kalshi prices signal
@@ -204,23 +219,25 @@ class BrainAgent:
             return
 
         limit_price = min(yes_ask + self._max_slippage_cents, max_tradeable_price(self._min_edge_cents))
+        quantity = self._quantity_for_price(yes_ask)
 
         signal = ExecuteTrade(
             signal_id=str(uuid.uuid4()),
             market_ticker=entry.market_ticker,
             side=entry.side,
             max_price_cents=limit_price,
-            quantity=self._default_quantity,
+            quantity=quantity,
             game_id=event.game_id,
             generated_at_ns=time.monotonic_ns(),
         )
         self._bus.publish_trade_signal(signal)
         log.info(
             "Brain SIGNAL: game=%s total=%d trigger=%d ticker=%s "
-            "yes_ask=%d limit=%d qty=%d signal_id=%s",
+            "yes_ask=%d limit=%d qty=%d spend≈$%.2f signal_id=%s",
             event.game_id, event.total_score, entry.trigger_score,
             entry.market_ticker, yes_ask, limit_price,
-            signal.quantity, signal.signal_id,
+            signal.quantity, (signal.quantity * yes_ask) / 100,
+            signal.signal_id,
         )
 
     async def _check_moneyline_signal(
@@ -281,12 +298,13 @@ class BrainAgent:
                 continue
 
             entry.mark_signaled(now_ns)
+            quantity = self._quantity_for_price(ask)
             signal = ExecuteTrade(
                 signal_id=str(uuid.uuid4()),
                 market_ticker=entry.market_ticker,
                 side=entry.trade_side,
                 max_price_cents=min(ask + self._max_slippage_cents, 97),
-                quantity=self._default_quantity,
+                quantity=quantity,
                 game_id=event.game_id,
                 generated_at_ns=now_ns,
             )
