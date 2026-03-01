@@ -159,3 +159,8 @@ class KalshiRestClient:
 
     async def get_order(self, order_id: str) -> dict:
         return await self._request("GET", f"/portfolio/orders/{order_id}")
+
+    async def get_market(self, ticker: str) -> dict:
+        """Fetch a single market's current prices. Returns the market dict."""
+        resp = await self._request("GET", f"/markets/{ticker}")
+        return resp.get("market", {})

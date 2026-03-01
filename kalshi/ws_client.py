@@ -65,13 +65,22 @@ class KalshiWSClient:
     def subscribe(self, tickers: list[str]) -> None:
         """
         Register tickers to subscribe to.
-        If the WebSocket is already connected, sends a subscription immediately.
+        If the WebSocket is already connected, fires the subscription immediately
+        via create_task so it doesn't wait for the next incoming WS message.
         """
         new_tickers = [t for t in tickers if t not in self._subscribed_tickers]
         if not new_tickers:
             return
         self._subscribed_tickers.update(new_tickers)
-        # Push to live connection if it's already up
+        if self._live_ws is not None:
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._send_subscription_batch(self._live_ws, new_tickers),
+                    name="ws-subscribe-immediate",
+                )
+                return
+            except RuntimeError:
+                pass  # No running loop — fall through to queue
         try:
             self._pending_subscribe.put_nowait(new_tickers)
         except asyncio.QueueFull:

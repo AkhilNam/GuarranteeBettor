@@ -43,6 +43,10 @@ if TYPE_CHECKING:
 # threshold — i.e., the current score is very close to that line.
 _CRUNCH_TIME_ASK_THRESHOLD = 60
 
+# How long to wait before retrying a failed game registration (Kalshi may not
+# have listed the market at the time of the first attempt).
+_REGISTRATION_RETRY_S = 60.0
+
 log = logging.getLogger(__name__)
 
 
@@ -76,6 +80,9 @@ class BrainAgent:
         # game_id -> registration state: "pending" | "registered" | "failed"
         self._game_state: dict[str, str] = {}
         self._ml_game_state: dict[str, str] = {}   # separate ML registration state
+        # Timestamps (monotonic) for when a game first entered "failed" state
+        self._game_state_failed_at: dict[str, float] = {}
+        self._ml_game_state_failed_at: dict[str, float] = {}
         self._shield: "ShieldAgent | None" = None
         self._risk: RiskState | None = None
         self._gate: CrunchTimeGate | None = None
@@ -126,11 +133,25 @@ class BrainAgent:
         if state is None:
             self._game_state[event.game_id] = "pending"
             await self._register_game(event)
+        elif state == "failed":
+            failed_at = self._game_state_failed_at.get(event.game_id, 0.0)
+            if (time.monotonic() - failed_at) >= _REGISTRATION_RETRY_S:
+                self._todays_markets.pop(event.sport, None)  # force fresh fetch
+                self._game_state[event.game_id] = "pending"
+                await self._register_game(event)
 
         # ── Moneyline registration (independent of totals) ───────────────────
-        if self._moneyline_map and self._ml_game_state.get(event.game_id) is None:
-            self._ml_game_state[event.game_id] = "pending"
-            await self._register_moneyline(event)
+        if self._moneyline_map:
+            ml_state = self._ml_game_state.get(event.game_id)
+            if ml_state is None:
+                self._ml_game_state[event.game_id] = "pending"
+                await self._register_moneyline(event)
+            elif ml_state == "failed":
+                failed_at = self._ml_game_state_failed_at.get(event.game_id, 0.0)
+                if (time.monotonic() - failed_at) >= _REGISTRATION_RETRY_S:
+                    self._ml_todays_markets.pop(event.sport, None)  # force fresh fetch
+                    self._ml_game_state[event.game_id] = "pending"
+                    await self._register_moneyline(event)
 
         # Check crunch time BEFORE threshold scan — activates fast ESPN polling
         if self._game_state.get(event.game_id) == "registered":
@@ -198,6 +219,36 @@ class BrainAgent:
                 lowest.market_ticker, event.total_score, lowest.trigger_score,
             )
 
+    async def _fetch_market_via_rest(self, ticker: str):
+        """
+        REST fallback for when the WS hasn't delivered a snapshot yet.
+        Constructs a MarketUpdate, injects it into the watcher cache, and returns it.
+        Returns None if the market is halted (empty book) or the request fails.
+        """
+        from models.events import MarketUpdate
+        try:
+            data = await self._rest.get_market(ticker)
+            yes_ask = data.get("yes_ask") or 100
+            yes_bid = data.get("yes_bid") or 0
+            no_ask  = data.get("no_ask")  or 100
+            no_bid  = data.get("no_bid")  or 0
+            if yes_ask == 100 and yes_bid == 0:
+                log.info("Brain: REST fallback got empty book for %s — market likely halted", ticker)
+                return None
+            update = MarketUpdate(
+                market_ticker=ticker,
+                yes_bid=yes_bid, yes_ask=yes_ask,
+                no_bid=no_bid,  no_ask=no_ask,
+                yes_volume=0, sequence=0,
+                received_at_ns=time.monotonic_ns(),
+            )
+            await self._watcher.handle_update(update)
+            log.info("Brain: REST fallback ok for %s yes_ask=%d", ticker, yes_ask)
+            return update
+        except Exception as exc:
+            log.warning("Brain: REST fallback failed for %s: %s", ticker, exc)
+            return None
+
     async def _evaluate_and_signal(self, event: GameEvent, entry: ThresholdEntry) -> None:
         entry.already_triggered = True  # Set first — no duplicate signals even if eval fails
 
@@ -206,6 +257,8 @@ class BrainAgent:
             return
 
         market = self._watcher.get_latest(entry.market_ticker)
+        if market is None:
+            market = await self._fetch_market_via_rest(entry.market_ticker)
         if market is None:
             log.warning("Brain: no market data for %s — signal skipped", entry.market_ticker)
             return
@@ -327,6 +380,7 @@ class BrainAgent:
         series = self._ml_series_patterns.get(event.sport)
         if not series:
             self._ml_game_state[event.game_id] = "failed"
+            self._ml_game_state_failed_at[event.game_id] = time.monotonic()
             return
 
         today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
@@ -342,11 +396,13 @@ class BrainAgent:
                 event.game_id, event.home_team, event.away_team,
             )
             self._ml_game_state[event.game_id] = "failed"
+            self._ml_game_state_failed_at[event.game_id] = time.monotonic()
             return
 
         entries = _build_moneyline_entries(game_markets, event)
         if not entries:
             self._ml_game_state[event.game_id] = "failed"
+            self._ml_game_state_failed_at[event.game_id] = time.monotonic()
             return
 
         tickers = list({e.market_ticker for e in entries})
@@ -391,6 +447,7 @@ class BrainAgent:
                 event.game_id, event.home_team, event.away_team,
             )
             self._game_state[event.game_id] = "failed"
+            self._game_state_failed_at[event.game_id] = time.monotonic()
             return
 
         tickers = [m["ticker"] for m in game_markets]
@@ -414,6 +471,7 @@ class BrainAgent:
         if not entries:
             log.warning("Brain: no threshold entries built for game=%s", event.game_id)
             self._game_state[event.game_id] = "failed"
+            self._game_state_failed_at[event.game_id] = time.monotonic()
             return
 
         self._threshold_map.register_game(event.sport, event.game_id, entries)
