@@ -61,6 +61,9 @@ class KalshiWSClient:
         self._live_ws = None
         # Queue for tickers to subscribe on the live connection
         self._pending_subscribe: asyncio.Queue[list[str]] = asyncio.Queue()
+        # Full orderbook state per ticker: ticker -> {"yes": {price: qty}, "no": {price: qty}}
+        # Maintained across snapshots and deltas so best bid/ask is always accurate.
+        self._books: dict[str, dict[str, dict[int, int]]] = {}
 
     def subscribe(self, tickers: list[str]) -> None:
         """
@@ -187,16 +190,44 @@ class KalshiWSClient:
             )
         self._last_seq[ticker] = seq
 
-        # Extract best bid/ask from the snapshot/delta
         # Kalshi WS format: {"yes": [[price, qty], ...], "no": [[price, qty], ...]}
+        # qty == 0 in a delta means remove that price level.
         yes_levels: list[list[int]] = data.get("yes", [])
         no_levels: list[list[int]] = data.get("no", [])
 
-        yes_ask = self._best_ask(yes_levels)
-        yes_bid = self._best_bid(yes_levels)
-        no_ask = self._best_ask(no_levels)
-        no_bid = self._best_bid(no_levels)
-        yes_volume = self._volume_at_ask(yes_levels, yes_ask) if yes_ask is not None else 0
+        if msg_type == "orderbook_snapshot":
+            # Replace the full book for this ticker
+            self._books[ticker] = {
+                "yes": {p: q for p, q in yes_levels if q > 0},
+                "no": {p: q for p, q in no_levels if q > 0},
+            }
+        else:  # orderbook_delta
+            if ticker not in self._books:
+                # Can't apply a delta without a prior snapshot — skip this message.
+                # The next snapshot (on reconnect or re-subscribe) will restore state.
+                log.warning("Delta for %s received before snapshot — skipping", ticker)
+                return
+            yes_book = self._books[ticker]["yes"]
+            no_book = self._books[ticker]["no"]
+            for p, q in yes_levels:
+                if q == 0:
+                    yes_book.pop(p, None)
+                else:
+                    yes_book[p] = q
+            for p, q in no_levels:
+                if q == 0:
+                    no_book.pop(p, None)
+                else:
+                    no_book[p] = q
+
+        # Compute best bid/ask from the full maintained book
+        yes_book = self._books[ticker]["yes"]
+        no_book = self._books[ticker]["no"]
+        yes_ask = min(yes_book.keys(), default=None)
+        yes_bid = max(yes_book.keys(), default=None)
+        no_ask = min(no_book.keys(), default=None)
+        no_bid = max(no_book.keys(), default=None)
+        yes_volume = yes_book.get(yes_ask, 0) if yes_ask is not None else 0
 
         update = MarketUpdate(
             market_ticker=ticker,
@@ -209,23 +240,3 @@ class KalshiWSClient:
             received_at_ns=received_at,
         )
         await self._on_update(update)
-
-    @staticmethod
-    def _best_ask(levels: list[list[int]]) -> int | None:
-        """Lowest ask price from a list of [price, qty] levels."""
-        asks = [p for p, q in levels if q > 0]
-        return min(asks) if asks else None
-
-    @staticmethod
-    def _best_bid(levels: list[list[int]]) -> int | None:
-        bids = [p for p, q in levels if q > 0]
-        return max(bids) if bids else None
-
-    @staticmethod
-    def _volume_at_ask(levels: list[list[int]], ask: int | None) -> int:
-        if ask is None:
-            return 0
-        for p, q in levels:
-            if p == ask:
-                return q
-        return 0

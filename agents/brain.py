@@ -417,6 +417,7 @@ class BrainAgent:
             date_prefix = datetime.now(tz=timezone.utc).strftime("%y%b%d").upper()
             todays = [m for m in markets if f"-{date_prefix}" in m.get("ticker", "")]
             self._ml_todays_markets[sport] = todays
+            self._markets_fetched_date = today
             log.info(
                 "Brain ML: fetched %d/%d %s markets for today (%s)",
                 len(todays), len(markets), series, date_prefix,
@@ -583,17 +584,16 @@ def _filter_markets_for_game(markets: list[dict], event: GameEvent) -> list[dict
     """
     From today's pre-fetched markets, find those matching this specific game.
 
-    Matching strategy:
-      1. Parse Kalshi market title to extract full team names (the authoritative source).
-         e.g. "Gardner-Webb at Radford: Total Points" → away="Gardner-Webb", home="Radford"
-      2. Generate all abbreviation candidates from those full names (handles the many
-         abbreviation styles SportsData.io uses: prefix, compound, acronym).
-      3. Check if SportsData's HomeTeam/AwayTeam starts with any candidate.
-    """
-    home_abbrev = event.home_team.upper()
-    away_abbrev = event.away_team.upper()
+    event.home_team / event.away_team are now full institution names from ESPN
+    (e.g. "North Carolina", "Kentucky", "Gardner-Webb") which match the names
+    Kalshi uses in market titles directly.
 
-    # Group markets by game (same title = same game)
+    Matching: parse the Kalshi title into away/home names, then do a
+    case-insensitive fuzzy name comparison (handles minor spelling differences).
+    """
+    home_name = event.home_team
+    away_name = event.away_team
+
     game_groups: dict[str, list[dict]] = {}
     for mkt in markets:
         title = mkt.get("title", "")
@@ -603,8 +603,7 @@ def _filter_markets_for_game(markets: list[dict], event: GameEvent) -> list[dict
         kalshi_away, kalshi_home = _parse_title(title)
         if not kalshi_away or not kalshi_home:
             continue
-        if _abbrev_matches_name(home_abbrev, kalshi_home) and \
-           _abbrev_matches_name(away_abbrev, kalshi_away):
+        if _name_matches(home_name, kalshi_home) and _name_matches(away_name, kalshi_away):
             return group
 
     return []
@@ -619,92 +618,41 @@ def _parse_title(title: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _abbrev_matches_name(abbrev: str, full_name: str) -> bool:
+def _name_matches(espn_name: str, kalshi_name: str) -> bool:
     """
-    Check whether a SportsData abbreviation (e.g. 'BCOOK') plausibly refers
-    to a school with the given full name (e.g. 'Bethune-Cookman').
+    Compare an ESPN institution name against a Kalshi market title team name.
 
-    Handles multiple abbreviation styles:
-      - Simple prefix:      RADF   → Radford
-      - Word prefix:        BING   → Binghamton
-      - Compound (1+N):     BCOOK  → Bethune-Cookman  (B + COOK)
-      - Compound (2+N):     CABAP  → California Baptist (CA + BAP)
-      - Compound (3+N):     MASLOW → UMass Lowell      (MAS + LOW, U-prefix stripped)
-      - Acronym:            UMBC   → UMBC
-      - Vowel-dropping:     LIBRTY → Liberty            (subsequence of word)
+    Both are now full names (e.g. "North Carolina" vs "North Carolina"),
+    so direct comparison works for the vast majority of cases.
+    Token-overlap handles minor differences like "UC Davis" vs "California Davis"
+    or truncated names.
     """
     import re
-    abbrev = abbrev.upper()
-    words = [w for w in re.split(r"[\s\-\.&]+", full_name.upper()) if w]
+    a = espn_name.strip().upper()
+    b = kalshi_name.strip().upper()
+    if not a or not b:
+        return False
 
-    # 1. Simple prefix of any single word
-    for word in words:
-        if len(word) >= 3 and abbrev.startswith(word[:min(len(word), len(abbrev))]):
-            return True
-        if len(abbrev) >= 3 and word.startswith(abbrev[:min(len(abbrev), len(word))]):
-            return True
-
-    # 2. Acronym: abbrev == first letters of each word, OR the acronym is *contained*
-    #    in the abbrev (handles e.g. UMKC → "Kansas City" where acronym KC ⊆ UMKC)
-    if len(words) >= 2:
-        acronym = "".join(w[0] for w in words if w)
-        if abbrev == acronym or abbrev.startswith(acronym) or acronym in abbrev:
-            return True
-
-    # 3. Compound: first 1-3 chars of word[0] + first 1-5 chars of word[1] or last word.
-    #    Also try with "U"-prefix stripped from words like UMASS → MASS, UCONN → CONN
-    #    (many schools are written as "UMass Lowell", "UConn", etc. on Kalshi but
-    #     SportsData abbreviations use the base name, e.g. MASLOW for Massachusetts Lowell)
-    word_variants: list[list[str]] = [words]
-    stripped = [w[1:] if (w.startswith("U") and len(w) > 2 and w[1] not in "AEIOU") else w
-                for w in words]
-    if stripped != words:
-        word_variants.append(stripped)
-
-    for wlist in word_variants:
-        if len(wlist) >= 2:
-            for w1_len in (1, 2, 3):
-                for w2_len in (1, 2, 3, 4, 5):
-                    if len(wlist[0]) >= w1_len and len(wlist[-1]) >= w2_len:
-                        candidate = wlist[0][:w1_len] + wlist[-1][:w2_len]
-                        if abbrev == candidate or abbrev.startswith(candidate):
-                            return True
-                    # Also try middle word
-                    if len(wlist) >= 3 and len(wlist[0]) >= w1_len and len(wlist[1]) >= w2_len:
-                        candidate = wlist[0][:w1_len] + wlist[1][:w2_len]
-                        if abbrev == candidate or abbrev.startswith(candidate):
-                            return True
-
-    # 3b. Shared 3-char prefix: abbrev's first 3 chars match any word's first 3 chars.
-    #     Handles multi-campus schools where Kalshi uses the short name but SportsData
-    #     encodes campus info (e.g. LOULAF → "Louisiana", TENTCH → "Tennessee Tech").
-    if len(abbrev) >= 4:
-        for word in words:
-            if len(word) >= 3 and abbrev[:3] == word[:3]:
-                return True
-
-    # 4. Abbrev is contained within cleaned full name (no spaces/hyphens)
-    clean = full_name.upper().replace(" ", "").replace("-", "").replace(".", "")
-    if abbrev[:4] in clean:
+    # Direct match
+    if a == b:
         return True
 
-    # 5. Vowel-dropping subsequence: abbrev chars appear in order within a single word
-    #    (e.g. LIBRTY → LIBERTY: skip the 'E', still a valid subsequence)
-    if len(abbrev) >= 4:
-        for word in words:
-            if _is_subsequence(abbrev, word):
-                return True
+    # One name is a substring of the other (handles "Connecticut" vs "UConn Connecticut")
+    if a in b or b in a:
+        return True
+
+    # Token-level overlap: strip noise words and check if all tokens of the
+    # shorter name appear in the longer name.
+    _NOISE = {"", "THE", "OF", "AT", "AND", "STATE", "UNIVERSITY", "COLLEGE"}
+    a_tokens = {t for t in re.split(r"[\s\-\.&]+", a) if t not in _NOISE}
+    b_tokens = {t for t in re.split(r"[\s\-\.&]+", b) if t not in _NOISE}
+    if a_tokens and b_tokens:
+        shorter, longer = (a_tokens, b_tokens) if len(a_tokens) <= len(b_tokens) else (b_tokens, a_tokens)
+        if shorter <= longer:
+            return True
+        # Partial overlap: at least one meaningful token matches and it's long enough
+        shared = shorter & longer
+        if shared and max(len(t) for t in shared) >= 4:
+            return True
 
     return False
-
-
-def _is_subsequence(abbrev: str, word: str) -> bool:
-    """Return True if abbrev is a subsequence of word with matching first character."""
-    if not abbrev or not word or abbrev[0] != word[0]:
-        return False
-    ai, wi = 0, 0
-    while ai < len(abbrev) and wi < len(word):
-        if abbrev[ai] == word[wi]:
-            ai += 1
-        wi += 1
-    return ai == len(abbrev)

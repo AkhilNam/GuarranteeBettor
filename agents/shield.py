@@ -36,12 +36,14 @@ class ShieldAgent:
         max_daily_loss_cents: int,
         max_open_exposure_cents: int,
         max_trades_per_game: int,
+        max_trades_per_day: int = 20,
     ) -> None:
         self._bus = bus
         self._risk = risk
         self._max_daily_loss = max_daily_loss_cents
         self._max_exposure = max_open_exposure_cents
         self._max_trades_per_game = max_trades_per_game
+        self._max_trades_per_day = max_trades_per_day
         # Trades per game tracking
         self._game_trade_count: dict[str, int] = {}
 
@@ -50,8 +52,10 @@ class ShieldAgent:
         return self._risk
 
     async def run(self) -> None:
-        log.info("Shield agent running (max_daily_loss=$%.2f max_exposure=$%.2f)",
-                 self._max_daily_loss / 100, self._max_exposure / 100)
+        log.info(
+            "Shield agent running (max_daily_loss=$%.2f max_exposure=$%.2f max_trades_per_day=%d)",
+            self._max_daily_loss / 100, self._max_exposure / 100, self._max_trades_per_day,
+        )
         while True:
             try:
                 report: FillReport = await self._bus.fill_reports.get()
@@ -83,6 +87,16 @@ class ShieldAgent:
     def _check_limits(self, report: FillReport) -> None:
         if self._risk.is_halted:
             return  # Already halted
+
+        # Daily trade count limit
+        if self._risk.trades_today >= self._max_trades_per_day:
+            reason = (
+                f"Daily trade limit reached: {self._risk.trades_today} "
+                f">= {self._max_trades_per_day}"
+            )
+            self._risk.halt(reason)
+            log.critical("SHIELD HALT: %s", reason)
+            return
 
         # Daily loss limit
         if self._risk.daily_realized_pnl_cents < -self._max_daily_loss:

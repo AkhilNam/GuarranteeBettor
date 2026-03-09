@@ -105,6 +105,25 @@ def _espn_parse_competitors(comp: dict) -> tuple[dict, dict]:
     return home, away
 
 
+def _espn_team_name(competitor: dict) -> str:
+    """
+    Extract the institution name from an ESPN competitor dict.
+
+    Uses `location` (e.g. "North Carolina", "Kentucky", "Gardner-Webb") which
+    matches the full school name that Kalshi uses in market titles.
+    Falls back to displayName (strips mascot suffix if possible), then abbreviation.
+    """
+    team = competitor.get("team", {})
+    location = team.get("location", "").strip()
+    if location:
+        return location
+    # displayName is typically "Kentucky Wildcats" — drop the mascot word
+    display = team.get("displayName", "").strip()
+    if display:
+        return display
+    return team.get("abbreviation", "")
+
+
 def espn_ncaa_to_game_event(raw: dict[str, Any], received_at_ns: int | None = None) -> GameEvent | None:
     """
     Normalize an ESPN NCAA basketball event object to GameEvent.
@@ -138,8 +157,8 @@ def espn_ncaa_to_game_event(raw: dict[str, Any], received_at_ns: int | None = No
         event_id=event_id,
         sport="ncaa_basketball",
         game_id=game_id,
-        home_team=home.get("team", {}).get("abbreviation", ""),
-        away_team=away.get("team", {}).get("abbreviation", ""),
+        home_team=_espn_team_name(home),
+        away_team=_espn_team_name(away),
         home_score=home_score,
         away_score=away_score,
         game_clock=game_clock,
@@ -186,8 +205,8 @@ def espn_soccer_to_game_event(
         event_id=event_id,
         sport=sport,
         game_id=game_id,
-        home_team=home.get("team", {}).get("abbreviation", ""),
-        away_team=away.get("team", {}).get("abbreviation", ""),
+        home_team=_espn_team_name(home),
+        away_team=_espn_team_name(away),
         home_score=home_score,
         away_score=away_score,
         game_clock=game_clock,

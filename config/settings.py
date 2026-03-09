@@ -51,6 +51,7 @@ class Settings:
     max_daily_loss_cents: int             # Circuit breaker: halt if daily P&L < -X
     max_open_exposure_cents: int          # Max total exposure across all open positions
     max_trades_per_game: int              # Stop trading a game after N fills
+    max_trades_per_day: int               # Hard cap on total fills across all games today
     keepalive_interval_s: float           # REST connection keepalive ping interval
 
     # --- Polling ---
@@ -90,6 +91,7 @@ def load_settings() -> Settings:
         max_daily_loss_cents=int(_optional("MAX_DAILY_LOSS_CENTS", "10000")),   # $100
         max_open_exposure_cents=int(_optional("MAX_OPEN_EXPOSURE_CENTS", "50000")),  # $500
         max_trades_per_game=int(_optional("MAX_TRADES_PER_GAME", "5")),
+        max_trades_per_day=int(_optional("MAX_TRADES_PER_DAY", "20")),
         keepalive_interval_s=float(_optional("KEEPALIVE_INTERVAL_S", "30")),
         sports_poll_interval_s=float(_optional("SPORTS_POLL_INTERVAL_S", "0.75")),
     )

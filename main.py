@@ -146,6 +146,7 @@ async def run() -> None:
         max_daily_loss_cents=settings.max_daily_loss_cents,
         max_open_exposure_cents=settings.max_open_exposure_cents,
         max_trades_per_game=settings.max_trades_per_game,
+        max_trades_per_day=settings.max_trades_per_day,
     )
     brain.set_shield(shield, risk)
     brain.set_gate(gate)
